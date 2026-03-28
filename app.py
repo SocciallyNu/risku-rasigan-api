@@ -6,17 +6,54 @@ from firebase_admin import credentials, firestore, messaging
 import math
 import os
 import json
+import time
 
 app = Flask(__name__)
 CORS(app)
 
+# Cache: {ticker: {data: {...}, timestamp: float}}
+_cache = {}
+CACHE_TTL = 900  # 15 minutes
+
 # Initialize Firebase Admin
 if not firebase_admin._apps:
-    firebase_creds = json.loads(os.environ.get('FIREBASE_SERVICE_ACCOUNT', '{}'))
-    cred = credentials.Certificate(firebase_creds)
-    firebase_admin.initialize_app(cred)
+    firebase_creds_str = os.environ.get('FIREBASE_SERVICE_ACCOUNT', '{}')
+    if firebase_creds_str and firebase_creds_str != '{}':
+        try:
+            firebase_creds = json.loads(firebase_creds_str)
+            cred = credentials.Certificate(firebase_creds)
+            firebase_admin.initialize_app(cred)
+        except Exception as e:
+            print(f'Firebase init error: {e}')
 
-db = firestore.client()
+def get_db():
+    try:
+        return firestore.client()
+    except:
+        return None
+
+def fetch_stock_data(symbol):
+    now = time.time()
+    if symbol in _cache:
+        cached = _cache[symbol]
+        if now - cached['timestamp'] < CACHE_TTL:
+            return cached['data'], True
+    
+    ticker = yf.Ticker(symbol)
+    info = ticker.info
+    
+    data = {
+        'last_price': info.get('currentPrice') or info.get('regularMarketPrice') or 0,
+        'pe_ratio': info.get('trailingPE') or 0,
+        'earnings_per_share': info.get('trailingEps') or 0,
+        'book_value': info.get('bookValue') or 0,
+        'dividend_yield': info.get('dividendYield') or 0,
+        'sector': info.get('sector') or '',
+        'company_name': info.get('longName') or symbol,
+    }
+    
+    _cache[symbol] = {'data': data, 'timestamp': now}
+    return data, False
 
 @app.route('/stock', methods=['GET'])
 def get_stock():
@@ -26,20 +63,12 @@ def get_stock():
     if not symbol.endswith('.NS') and not symbol.endswith('.BO'):
         symbol = f'{symbol}.NS'
     try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
+        data, from_cache = fetch_stock_data(symbol)
         return jsonify({
             'status': 'success',
             'symbol': symbol,
-            'data': {
-                'last_price': info.get('currentPrice') or info.get('regularMarketPrice') or 0,
-                'pe_ratio': info.get('trailingPE') or 0,
-                'earnings_per_share': info.get('trailingEps') or 0,
-                'book_value': info.get('bookValue') or 0,
-                'dividend_yield': info.get('dividendYield') or 0,
-                'sector': info.get('sector') or '',
-                'company_name': info.get('longName') or symbol,
-            }
+            'from_cache': from_cache,
+            'data': data
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -50,6 +79,9 @@ def health():
 
 @app.route('/check_signals', methods=['POST'])
 def check_signals():
+    db = get_db()
+    if not db:
+        return jsonify({'status': 'error', 'message': 'Firebase not initialized'}), 500
     try:
         users_ref = db.collection('users').stream()
         for user_doc in users_ref:
@@ -59,7 +91,6 @@ def check_signals():
             if not fcm_token:
                 continue
 
-            # Load thresholds
             pe_threshold = 22.5
             div_threshold = 1.0
             try:
@@ -72,7 +103,6 @@ def check_signals():
             except:
                 pass
 
-            # Load stocks
             stocks = db.collection('users').document(uid)\
                 .collection('stocks').stream()
 
@@ -83,15 +113,13 @@ def check_signals():
                 ticker_sym = s.get('ticker', '')
                 if not ticker_sym:
                     continue
-
                 try:
-                    t = yf.Ticker(f'{ticker_sym}.NS')
-                    info = t.info
-                    price = info.get('currentPrice') or info.get('regularMarketPrice') or 0
-                    pe = info.get('trailingPE') or 0
-                    eps = s.get('manualEps') or info.get('trailingEps') or 0
-                    bv = s.get('manualBookValue') or info.get('bookValue') or 0
-                    div = (info.get('dividendYield') or 0) * 100
+                    data, _ = fetch_stock_data(f'{ticker_sym}.NS')
+                    price = data['last_price']
+                    pe = data['pe_ratio']
+                    eps = s.get('manualEps') or data['earnings_per_share']
+                    bv = s.get('manualBookValue') or data['book_value']
+                    div = data['dividend_yield'] * 100
 
                     graham = math.sqrt(22.5 * eps * bv) if eps > 0 and bv > 0 else 0
                     pbv = price / bv if bv > 0 else 0
@@ -113,7 +141,8 @@ def check_signals():
                                 'dividendYield': div / 100,
                                 'triggeredAt': firestore.SERVER_TIMESTAMP,
                             })
-                except:
+                except Exception as e:
+                    print(f'Error processing {ticker_sym}: {e}')
                     continue
 
             if triggered:

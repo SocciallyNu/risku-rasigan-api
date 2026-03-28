@@ -1,8 +1,6 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
-import firebase_admin
-from firebase_admin import credentials, firestore, messaging
 import math
 import os
 import json
@@ -11,26 +9,23 @@ import time
 app = Flask(__name__)
 CORS(app)
 
-# Cache: {ticker: {data: {...}, timestamp: float}}
 _cache = {}
-CACHE_TTL = 900  # 15 minutes
+CACHE_TTL = 900
 
-# Initialize Firebase Admin
-if not firebase_admin._apps:
-    firebase_creds_str = os.environ.get('FIREBASE_SERVICE_ACCOUNT', '{}')
-    if firebase_creds_str and firebase_creds_str != '{}':
-        try:
-            firebase_creds = json.loads(firebase_creds_str)
-            cred = credentials.Certificate(firebase_creds)
-            firebase_admin.initialize_app(cred)
-        except Exception as e:
-            print(f'Firebase init error: {e}')
-
-def get_db():
+def get_firebase():
     try:
-        return firestore.client()
-    except:
-        return None
+        import firebase_admin
+        from firebase_admin import credentials, firestore, messaging
+        if not firebase_admin._apps:
+            firebase_creds_str = os.environ.get('FIREBASE_SERVICE_ACCOUNT', '{}')
+            if firebase_creds_str and firebase_creds_str != '{}':
+                firebase_creds = json.loads(firebase_creds_str)
+                cred = credentials.Certificate(firebase_creds)
+                firebase_admin.initialize_app(cred)
+        return firestore.client(), messaging
+    except Exception as e:
+        print(f'Firebase error: {e}')
+        return None, None
 
 def fetch_stock_data(symbol):
     now = time.time()
@@ -38,10 +33,8 @@ def fetch_stock_data(symbol):
         cached = _cache[symbol]
         if now - cached['timestamp'] < CACHE_TTL:
             return cached['data'], True
-    
     ticker = yf.Ticker(symbol)
     info = ticker.info
-    
     data = {
         'last_price': info.get('currentPrice') or info.get('regularMarketPrice') or 0,
         'pe_ratio': info.get('trailingPE') or 0,
@@ -51,7 +44,6 @@ def fetch_stock_data(symbol):
         'sector': info.get('sector') or '',
         'company_name': info.get('longName') or symbol,
     }
-    
     _cache[symbol] = {'data': data, 'timestamp': now}
     return data, False
 
@@ -79,10 +71,11 @@ def health():
 
 @app.route('/check_signals', methods=['POST'])
 def check_signals():
-    db = get_db()
+    db, messaging = get_firebase()
     if not db:
         return jsonify({'status': 'error', 'message': 'Firebase not initialized'}), 500
     try:
+        from firebase_admin import firestore as fs
         users_ref = db.collection('users').stream()
         for user_doc in users_ref:
             uid = user_doc.id
@@ -105,7 +98,6 @@ def check_signals():
 
             stocks = db.collection('users').document(uid)\
                 .collection('stocks').stream()
-
             triggered = []
 
             for stock_doc in stocks:
@@ -125,11 +117,7 @@ def check_signals():
                     pbv = price / bv if bv > 0 else 0
                     pex_pbv = pe * pbv
 
-                    graham_ok = graham > 0 and price < graham
-                    pe_ok = pex_pbv > 0 and pex_pbv < pe_threshold
-                    div_ok = div >= div_threshold
-
-                    if graham_ok and pe_ok and div_ok:
+                    if graham > 0 and price < graham and pex_pbv > 0 and pex_pbv < pe_threshold and div >= div_threshold:
                         triggered.append(s.get('name', ticker_sym))
                         db.collection('users').document(uid)\
                             .collection('alerts').add({
@@ -139,22 +127,22 @@ def check_signals():
                                 'grahamValue': graham,
                                 'pexPbv': pex_pbv,
                                 'dividendYield': div / 100,
-                                'triggeredAt': firestore.SERVER_TIMESTAMP,
+                                'triggeredAt': fs.SERVER_TIMESTAMP,
                             })
                 except Exception as e:
-                    print(f'Error processing {ticker_sym}: {e}')
+                    print(f'Error {ticker_sym}: {e}')
                     continue
 
             if triggered:
-                count = len(triggered)
-                message = messaging.Message(
-                    notification=messaging.Notification(
+                from firebase_admin import messaging as msg
+                message = msg.Message(
+                    notification=msg.Notification(
                         title='Risku Rasigan 📈',
-                        body=f'Kanna {count} laddu thinna aasaya aasaya aasaya 🍬',
+                        body=f'Kanna {len(triggered)} laddu thinna aasaya aasaya aasaya 🍬',
                     ),
                     token=fcm_token,
                 )
-                messaging.send(message)
+                msg.send(message)
 
         return jsonify({'status': 'ok'})
     except Exception as e:

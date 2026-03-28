@@ -2,13 +2,18 @@ name: Check Buy Signals
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # every 6 hours
-  workflow_dispatch:  # manual trigger for testing
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      - name: Wake up server
+        run: curl https://risku-rasigan-api.onrender.com/health
+
+      - name: Wait for server to wake
+        run: sleep 10
+
       - name: Trigger signal check
-        run: |
-          curl -X POST https://risku-rasigan-api.onrender.com/check_signals
+        run: curl -X POST https://risku-rasigan-api.onrender.com/check_signals
